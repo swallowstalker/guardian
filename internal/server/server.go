@@ -18,18 +18,18 @@ import (
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	handlerv1beta1 "github.com/odpf/guardian/api/handler/v1beta1"
 	guardianv1beta1 "github.com/odpf/guardian/api/proto/odpf/guardian/v1beta1"
+	"github.com/odpf/guardian/internal/server/interceptor"
 	"github.com/odpf/guardian/internal/store/postgres"
 	"github.com/odpf/guardian/jobs"
 	"github.com/odpf/guardian/pkg/crypto"
 	"github.com/odpf/guardian/pkg/scheduler"
-	"github.com/odpf/guardian/pkg/tracing"
 	"github.com/odpf/guardian/plugins/notifiers"
 	audit_repos "github.com/odpf/salt/audit/repositories"
 	"github.com/odpf/salt/log"
-	"github.com/odpf/salt/mux"
 	"github.com/sirupsen/logrus"
-	"github.com/uptrace/opentelemetry-go-extra/otelgorm"
-	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+	"google.golang.org/api/idtoken"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/encoding/protojson"
 )
@@ -40,7 +40,6 @@ var (
 
 const (
 	GRPCMaxClientSendSize = 32 << 20
-	defaultGracePeriod    = 5 * time.Second
 )
 
 // RunServer runs the application server
@@ -52,12 +51,6 @@ func RunServer(config *Config) error {
 	if err != nil {
 		return err
 	}
-
-	shutdown, err := tracing.InitTracer(config.Telemetry)
-	if err != nil {
-		return err
-	}
-	defer shutdown()
 
 	services, err := InitServices(ServiceDeps{
 		Config:    config,
@@ -104,27 +97,19 @@ func RunServer(config *Config) error {
 
 	// init grpc server
 	logrusEntry := logrus.NewEntry(logrus.New()) // TODO: get logrus instance from `logger` var
+
+	unaryInterceptors, err := prepareUnaryInterceptors(config, logger, logrusEntry)
 	grpcServer := grpc.NewServer(
 		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
 			grpc_logrus.StreamServerInterceptor(logrusEntry),
-			otelgrpc.StreamServerInterceptor(),
 		)),
 		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-			grpc_recovery.UnaryServerInterceptor(
-				grpc_recovery.WithRecoveryHandler(func(p interface{}) (err error) {
-					logger.Error(string(debug.Stack()))
-					return status.Errorf(codes.Internal, "Internal error, please check log")
-				}),
-			),
-			grpc_logrus.UnaryServerInterceptor(logrusEntry),
-			withAuthenticatedUserEmail(config.AuthenticatedUserHeaderKey),
-			otelgrpc.UnaryServerInterceptor(),
+			unaryInterceptors...,
 		)),
 	)
 	protoAdapter := handlerv1beta1.NewAdapter()
 	guardianv1beta1.RegisterGuardianServiceServer(grpcServer, handlerv1beta1.NewGRPCServer(
 		services.ResourceService,
-		services.ActivityService,
 		services.ProviderService,
 		services.PolicyService,
 		services.AppealService,
@@ -178,13 +163,22 @@ func RunServer(config *Config) error {
 	})
 	baseMux.Handle("/api/", http.StripPrefix("/api", gwmux))
 
-	logger.Info(fmt.Sprintf("server running on %s", address))
+	server := &http.Server{
+		Handler:      grpcHandlerFunc(grpcServer, baseMux),
+		Addr:         address,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
 
-	return mux.Serve(runtimeCtx, address,
-		mux.WithHTTP(baseMux),
-		mux.WithGRPC(grpcServer),
-		mux.WithGracePeriod(defaultGracePeriod),
-	)
+	logger.Info(fmt.Sprintf("server running on port: %d", config.Port))
+	if err := server.ListenAndServe(); err != nil {
+		if err != http.ErrServerClosed {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Migrate runs the schema migration scripts
@@ -194,9 +188,7 @@ func Migrate(c *Config) error {
 		return err
 	}
 
-	sqldb, _ := store.DB().DB()
-
-	auditRepository := audit_repos.NewPostgresRepository(sqldb)
+	auditRepository := audit_repos.NewPostgresRepository(store.DB())
 	if err := auditRepository.Init(context.Background()); err != nil {
 		return fmt.Errorf("initializing audit repository: %w", err)
 	}
@@ -205,13 +197,24 @@ func Migrate(c *Config) error {
 }
 
 func getStore(c *Config) (*postgres.Store, error) {
-	store, err := postgres.NewStore(&c.DB)
-	if c.Telemetry.Enabled {
-		if err := store.DB().Use(otelgorm.NewPlugin()); err != nil {
-			return store, err
+	return postgres.NewStore(&c.DB)
+}
+
+// grpcHandlerFunc routes http1 calls to baseMux and http2 with grpc header to grpcServer.
+// Using a single port for proxying both http1 & 2 protocols will degrade http performance
+// but for our usecase the convenience per performance tradeoff is better suited
+// if in future, this does become a bottleneck(which I highly doubt), we can break the service
+// into two ports, default port for grpc and default+1 for grpc-gateway proxy.
+// We can also use something like a connection multiplexer
+// https://github.com/soheilhy/cmux to achieve the same.
+func grpcHandlerFunc(grpcServer *grpc.Server, otherHandler http.Handler) http.Handler {
+	return h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor == 2 && strings.Contains(r.Header.Get("Content-Type"), "application/grpc") {
+			grpcServer.ServeHTTP(w, r)
+		} else {
+			otherHandler.ServeHTTP(w, r)
 		}
-	}
-	return store, err
+	}), &http2.Server{})
 }
 
 func makeHeaderMatcher(c *Config) func(key string) (string, bool) {
@@ -265,4 +268,38 @@ func fetchDefaultJobScheduleMapping() map[JobType]string {
 		RevokeExpiredGrants:       "*/20 * * * *",
 		ExpiringGrantNotification: "0 9 * * *",
 	}
+}
+
+func prepareUnaryInterceptors(config *Config, logger *log.Logrus, logrusEntry *logrus.Entry) ([]grpc.UnaryServerInterceptor, error) {
+	unaryServerInterceptors := []grpc.UnaryServerInterceptor{
+		grpc_recovery.UnaryServerInterceptor(
+			grpc_recovery.WithRecoveryHandler(func(p interface{}) (err error) {
+				logger.Error(string(debug.Stack()))
+				return status.Errorf(codes.Internal, "Internal error, please check log")
+			}),
+		),
+		grpc_logrus.UnaryServerInterceptor(logrusEntry),
+	}
+
+	if config.IdTokenValidation.Enabled {
+		idtokenValidator, err := idtoken.NewValidator(context.Background())
+		if err != nil {
+			return nil, err
+		}
+
+		params := &interceptor.IdTokenValidatorParams{
+			Audience:          config.IdTokenValidation.Audience,
+			ValidEmailDomains: config.IdTokenValidation.EligibleEmailDomains,
+			HeaderKey:         config.AuthenticatedUserHeaderKey,
+			ContextKey:        AuthenticatedUserEmailContextKey{},
+		}
+
+		bearerTokenValidator := interceptor.NewIdTokenValidator(idtokenValidator, params)
+		unaryServerInterceptors = append(unaryServerInterceptors, bearerTokenValidator.WithBearerTokenValidator())
+		return unaryServerInterceptors, nil
+	}
+
+	// default fallback to user email on header
+	unaryServerInterceptors = append(unaryServerInterceptors, withAuthenticatedUserEmail(config.AuthenticatedUserHeaderKey))
+	return unaryServerInterceptors, nil
 }

@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/odpf/guardian/internal/store"
-	"github.com/odpf/guardian/pkg/tracing"
 	"github.com/odpf/guardian/plugins/notifiers"
 	"github.com/odpf/salt/config"
 )
@@ -33,21 +32,30 @@ type Jobs struct {
 	ExpiringAccessNotification JobConfig `mapstructure:"expiring_access_notification"`
 }
 
+type IdTokenValidation struct {
+	Enabled              bool   `mapstructure:"enabled" default:"false"`
+	Audience             string `mapstructure:"audience"`
+	EligibleEmailDomains string `mapstructure:"eligible_email_domains"`
+}
+
 type Config struct {
-	Port                       int              `mapstructure:"port" default:"8080"`
-	EncryptionSecretKeyKey     string           `mapstructure:"encryption_secret_key"`
-	Notifier                   notifiers.Config `mapstructure:"notifier"`
-	LogLevel                   string           `mapstructure:"log_level" default:"info"`
-	DB                         store.Config     `mapstructure:"db"`
-	AuthenticatedUserHeaderKey string           `mapstructure:"authenticated_user_header_key"`
-	AuditLogTraceIDHeaderKey   string           `mapstructure:"audit_log_trace_id_header_key" default:"X-Trace-Id"`
-	Jobs                       Jobs             `mapstructure:"jobs"`
-	Telemetry                  tracing.Config   `mapstructure:"telemetry"`
+	Port                       int               `mapstructure:"port" default:"8080"`
+	EncryptionSecretKeyKey     string            `mapstructure:"encryption_secret_key"`
+	Notifier                   notifiers.Config  `mapstructure:"notifier"`
+	LogLevel                   string            `mapstructure:"log_level" default:"info"`
+	DB                         store.Config      `mapstructure:"db"`
+	AuthenticatedUserHeaderKey string            `mapstructure:"authenticated_user_header_key"`
+	AuditLogTraceIDHeaderKey   string            `mapstructure:"audit_log_trace_id_header_key" default:"X-Trace-Id"`
+	Jobs                       Jobs              `mapstructure:"jobs"`
+	IdTokenValidation          IdTokenValidation `mapstructure:"idtoken_validation"`
 }
 
 func LoadConfig(configFile string) (Config, error) {
 	var cfg Config
-	loader := config.NewLoader(config.WithFile(configFile))
+	loader := config.NewLoader(
+		config.WithPath(configFile),
+		config.WithEnvPrefix("SERVER"),
+	)
 
 	if err := loader.Load(&cfg); err != nil {
 		if errors.As(err, &config.ConfigFileNotFoundError{}) {
